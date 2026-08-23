@@ -253,7 +253,7 @@ FfxFloat32 ViewSpaceToMetersFactor()
 	layout (r8)            uniform image2D rw_new_locks;
 #endif
 #if defined FSR2_BIND_UAV_PREPARED_INPUT_COLOR
-	layout (rgba16)        writeonly uniform image2D rw_prepared_input_color;
+	layout (rgba16f)       writeonly uniform image2D rw_prepared_input_color;
 #endif
 #if defined FSR2_BIND_UAV_LUMA_HISTORY
 	layout (rgba8)         uniform image2D rw_luma_history;
