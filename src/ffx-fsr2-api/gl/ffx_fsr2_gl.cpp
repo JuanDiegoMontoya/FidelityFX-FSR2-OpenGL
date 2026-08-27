@@ -107,6 +107,7 @@ struct BackendContext_GL {
     PFNGLSAMPLERPARAMETERFPROC glSamplerParameterf = nullptr;
     PFNGLCREATEBUFFERSPROC glCreateBuffers = nullptr;
     PFNGLNAMEDBUFFERSTORAGEPROC glNamedBufferStorage = nullptr;
+    PFNGLNAMEDBUFFERSUBDATAPROC glNamedBufferSubData = nullptr;
     PFNGLCREATETEXTURESPROC glCreateTextures = nullptr;
     PFNGLGENTEXTURESPROC glGenTextures = nullptr;
     PFNGLTEXTUREVIEWPROC glTextureView = nullptr;
@@ -221,6 +222,7 @@ static void loadGLFunctions(BackendContext_GL* backendContext, ffx_glGetProcAddr
   backendContext->glFunctionTable.glSamplerParameterf = (PFNGLSAMPLERPARAMETERFPROC)getProcAddress("glSamplerParameterf");
   backendContext->glFunctionTable.glCreateBuffers = (PFNGLCREATEBUFFERSPROC)getProcAddress("glCreateBuffers");
   backendContext->glFunctionTable.glNamedBufferStorage = (PFNGLNAMEDBUFFERSTORAGEPROC)getProcAddress("glNamedBufferStorage");
+  backendContext->glFunctionTable.glNamedBufferSubData = (PFNGLNAMEDBUFFERSUBDATAPROC)getProcAddress("glNamedBufferSubData");
   backendContext->glFunctionTable.glCreateTextures = (PFNGLCREATETEXTURESPROC)getProcAddress("glCreateTextures");
   backendContext->glFunctionTable.glGenTextures = (PFNGLGENTEXTURESPROC)getProcAddress("glGenTextures");
   backendContext->glFunctionTable.glTextureView = (PFNGLTEXTUREVIEWPROC)getProcAddress("glTextureView");
@@ -420,7 +422,7 @@ static BackendContext_GL::UniformBuffer accquireDynamicUBO(BackendContext_GL* ba
 
   if (pData)
   {
-    memcpy(ubo.pData, pData, size);
+    backendContext->glFunctionTable.glNamedBufferSubData(ubo.bufferResource.id, 0, size, pData);
   }
 
   backendContext->uboRingBufferIndex++;
@@ -690,16 +692,12 @@ FfxErrorCode CreateBackendContextGL(FfxFsr2Interface* backendInterface, FfxDevic
   {
     BackendContext_GL::UniformBuffer& ubo = backendContext->uboRingBuffer[i];
     backendContext->glFunctionTable.glCreateBuffers(1, &ubo.bufferResource.id);
-    constexpr GLbitfield mapFlags = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
-    backendContext->glFunctionTable.glNamedBufferStorage(ubo.bufferResource.id, FSR2_UBO_SIZE, nullptr, mapFlags);
-
-    // map the memory block 
-    ubo.pData = (uint8_t*)backendContext->glFunctionTable.glMapNamedBufferRange(ubo.bufferResource.id, 0, FSR2_UBO_SIZE, mapFlags);
-
-    if (!ubo.pData)
-    {
-      return FFX_ERROR_BACKEND_API_ERROR;
-    }
+    // Device-local storage updated with glNamedBufferSubData: a persistently+coherently
+    // mapped buffer lives in snooped system memory on NVIDIA, and every shader read of
+    // the constants then goes over the bus instead of through the cache hierarchy.
+    backendContext->glFunctionTable.glNamedBufferStorage(ubo.bufferResource.id, FSR2_UBO_SIZE, nullptr, GL_DYNAMIC_STORAGE_BIT);
+    ubo.pData = nullptr;
+  }
   }
 
   backendContext->gpuJobCount = 0;
@@ -1083,11 +1081,9 @@ static FfxErrorCode executeGpuJobCompute(BackendContext_GL* backendContext, FfxG
 
   const auto program = static_cast<GLuint>(reinterpret_cast<uintptr_t>(job->computeJobDescriptor.pipeline.pipeline));
 
-  // bind uavs (storage images)
-  if (job->computeJobDescriptor.pipeline.uavCount > 0)
-  {
-    addBarrier(backendContext, false, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
-  }
+  // One combined barrier covers both the image stores the UAVs of this dispatch will
+  // read-modify-write and the texture fetches of its SRVs.
+  backendContext->glFunctionTable.glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
   for (uint32_t uav = 0; uav < job->computeJobDescriptor.pipeline.uavCount; ++uav)
   {
@@ -1105,17 +1101,27 @@ static FfxErrorCode executeGpuJobCompute(BackendContext_GL* backendContext, FfxG
   }
 
   // bind srvs (sampled textures)
-  if (job->computeJobDescriptor.pipeline.srvCount > 0)
-  {
-    addBarrier(backendContext, false, FFX_RESOURCE_STATE_COMPUTE_READ);
-  }
 
   for (uint32_t srv = 0; srv < job->computeJobDescriptor.pipeline.srvCount; ++srv)
   {
     BackendContext_GL::Resource ffxResource = backendContext->resources[job->computeJobDescriptor.srvs[srv].internalIndex];
 
+    // Integer textures are incomplete under a linear-filtering sampler; give them the
+    // point sampler (matching what the shaders do with them anyway).
+    GLuint sampler = backendContext->linearSampler.id;
+    switch (ffxResource.resourceDescription.format)
+    {
+    case FFX_SURFACE_FORMAT_R32_UINT:
+    case FFX_SURFACE_FORMAT_R16_UINT:
+    case FFX_SURFACE_FORMAT_R16G16_UINT:
+    case FFX_SURFACE_FORMAT_R8_UINT:
+      sampler = backendContext->pointSampler.id;
+      break;
+    default:;
+    }
+
     backendContext->glFunctionTable.glBindTextureUnit(job->computeJobDescriptor.pipeline.srvResourceBindings[srv].slotIndex, ffxResource.textureAllMipsView.id);
-    backendContext->glFunctionTable.glBindSampler(job->computeJobDescriptor.pipeline.srvResourceBindings[srv].slotIndex, backendContext->linearSampler.id);
+    backendContext->glFunctionTable.glBindSampler(job->computeJobDescriptor.pipeline.srvResourceBindings[srv].slotIndex, sampler);
   }
 
   // update ubos (uniform buffers)
@@ -1197,6 +1203,15 @@ FfxErrorCode ExecuteGpuJobsGL(FfxFsr2Interface* backendInterface, FfxCommandList
     }
     default:;
     }
+  }
+
+  // Sampler objects bound above stay bound for whatever the application renders next
+  // and silently override its textures' own parameters (e.g. forcing mip filtering on
+  // a mipless single-level texture makes it incomplete, sampling solid black). Unbind
+  // them from every unit a pass may have used.
+  for (uint32_t i = 0; i < FFX_MAX_NUM_SRVS + 8; i++)
+  {
+    backendContext->glFunctionTable.glBindSampler(i, 0);
   }
 
   // check the execute function returned cleanly.
