@@ -32,46 +32,59 @@ FfxFloat32 ComputeDepthClip(FfxFloat32x2 fUvSample, FfxFloat32 fCurrentDepthSamp
     FfxFloat32 fDilatedSum = 0.0f;
     FfxFloat32 fDepth = 0.0f;
     FfxFloat32 fWeightSum = 0.0f;
-    for (FfxInt32 iSampleIndex = 0; iSampleIndex < 4; iSampleIndex++) {
 
-        const FfxInt32x2 iOffset = bilinearInfo.iOffsets[iSampleIndex];
-        const FfxInt32x2 iSamplePos = bilinearInfo.iBasePos + iOffset;
-
-        if (IsOnScreen(iSamplePos, RenderSize())) {
-            const FfxFloat32 fWeight = bilinearInfo.fWeights[iSampleIndex];
-            if (fWeight > fReconstructedDepthBilinearWeightThreshold) {
-
-                const FfxFloat32 fPrevDepthSample = LoadReconstructedPrevDepth(iSamplePos);
-                const FfxFloat32 fPrevNearestDepthViewSpace = GetViewSpaceDepth(fPrevDepthSample);
-
-                const FfxFloat32 fDepthDiff = fCurrentDepthViewSpace - fPrevNearestDepthViewSpace;
-
-                if (fDepthDiff > 0.0f) {
-
+    // Keep the indices literal. NVIDIA's OpenGL compiler otherwise places these
+    // private arrays in local memory even though every loop bound is constant.
 #if FFX_FSR2_OPTION_INVERTED_DEPTH
-                    const FfxFloat32 fPlaneDepth = ffxMin(fPrevDepthSample, fCurrentDepthSample);
+#define FFX_FSR2_DEPTH_PLANE(PREV_DEPTH, CURRENT_DEPTH) ffxMin((PREV_DEPTH), (CURRENT_DEPTH))
 #else
-                    const FfxFloat32 fPlaneDepth = ffxMax(fPrevDepthSample, fCurrentDepthSample);
+#define FFX_FSR2_DEPTH_PLANE(PREV_DEPTH, CURRENT_DEPTH) ffxMax((PREV_DEPTH), (CURRENT_DEPTH))
 #endif
-                    
-                    const FfxFloat32x3 fCenter = GetViewSpacePosition(FfxInt32x2(RenderSize() * 0.5f), RenderSize(), fPlaneDepth);
-                    const FfxFloat32x3 fCorner = GetViewSpacePosition(FfxInt32x2(0, 0), RenderSize(), fPlaneDepth);
 
-                    const FfxFloat32 fHalfViewportWidth = length(FfxFloat32x2(RenderSize()));
-                    const FfxFloat32 fDepthThreshold = ffxMax(fCurrentDepthViewSpace, fPrevNearestDepthViewSpace);
-
-                    const FfxFloat32 Ksep = 1.37e-05f;
-                    const FfxFloat32 Kfov = length(fCorner) / length(fCenter);
-                    const FfxFloat32 fRequiredDepthSeparation = Ksep * Kfov * fHalfViewportWidth * fDepthThreshold;
-
-                    const FfxFloat32 fResolutionFactor = ffxSaturate(length(FfxFloat32x2(RenderSize())) / length(FfxFloat32x2(1920.0f, 1080.0f)));
-                    const FfxFloat32 fPower = ffxLerp(1.0f, 3.0f, fResolutionFactor);
-                    fDepth += ffxPow(ffxSaturate(FfxFloat32(fRequiredDepthSeparation / fDepthDiff)), fPower) * fWeight;
-                    fWeightSum += fWeight;
-                }
-            }
-        }
+#define FFX_FSR2_ACCUMULATE_DEPTH_SAMPLE(SAMPLE_INDEX)                                             \
+    {                                                                                              \
+        const FfxInt32x2 iOffset = bilinearInfo.iOffsets[(SAMPLE_INDEX)];                           \
+        const FfxInt32x2 iSamplePos = bilinearInfo.iBasePos + iOffset;                              \
+        if (IsOnScreen(iSamplePos, RenderSize())) {                                                 \
+            const FfxFloat32 fWeight = bilinearInfo.fWeights[(SAMPLE_INDEX)];                        \
+            if (fWeight > fReconstructedDepthBilinearWeightThreshold) {                             \
+                const FfxFloat32 fPrevDepthSample = LoadReconstructedPrevDepth(iSamplePos);          \
+                const FfxFloat32 fPrevNearestDepthViewSpace = GetViewSpaceDepth(fPrevDepthSample);   \
+                const FfxFloat32 fDepthDiff = fCurrentDepthViewSpace - fPrevNearestDepthViewSpace;   \
+                if (fDepthDiff > 0.0f) {                                                             \
+                    const FfxFloat32 fPlaneDepth =                                                   \
+                        FFX_FSR2_DEPTH_PLANE(fPrevDepthSample, fCurrentDepthSample);                  \
+                    const FfxFloat32x3 fCenter = GetViewSpacePosition(                               \
+                        FfxInt32x2(RenderSize() * 0.5f), RenderSize(), fPlaneDepth);                  \
+                    const FfxFloat32x3 fCorner =                                                     \
+                        GetViewSpacePosition(FfxInt32x2(0, 0), RenderSize(), fPlaneDepth);           \
+                    const FfxFloat32 fHalfViewportWidth = length(FfxFloat32x2(RenderSize()));        \
+                    const FfxFloat32 fDepthThreshold =                                               \
+                        ffxMax(fCurrentDepthViewSpace, fPrevNearestDepthViewSpace);                   \
+                    const FfxFloat32 Ksep = 1.37e-05f;                                               \
+                    const FfxFloat32 Kfov = length(fCorner) / length(fCenter);                        \
+                    const FfxFloat32 fRequiredDepthSeparation =                                      \
+                        Ksep * Kfov * fHalfViewportWidth * fDepthThreshold;                           \
+                    const FfxFloat32 fResolutionFactor = ffxSaturate(                                \
+                        length(FfxFloat32x2(RenderSize())) /                                        \
+                        length(FfxFloat32x2(1920.0f, 1080.0f)));                                    \
+                    const FfxFloat32 fPower = ffxLerp(1.0f, 3.0f, fResolutionFactor);                \
+                    fDepth += ffxPow(                                                               \
+                        ffxSaturate(FfxFloat32(fRequiredDepthSeparation / fDepthDiff)),              \
+                        fPower) * fWeight;                                                           \
+                    fWeightSum += fWeight;                                                           \
+                }                                                                                   \
+            }                                                                                       \
+        }                                                                                           \
     }
+
+    FFX_FSR2_ACCUMULATE_DEPTH_SAMPLE(0)
+    FFX_FSR2_ACCUMULATE_DEPTH_SAMPLE(1)
+    FFX_FSR2_ACCUMULATE_DEPTH_SAMPLE(2)
+    FFX_FSR2_ACCUMULATE_DEPTH_SAMPLE(3)
+
+#undef FFX_FSR2_ACCUMULATE_DEPTH_SAMPLE
+#undef FFX_FSR2_DEPTH_PLANE
 
     return (fWeightSum > 0) ? ffxSaturate(1.0f - fDepth / fWeightSum) : 0.0f;
 }
@@ -158,46 +171,68 @@ void PreProcessReactiveMasks(FfxInt32x2 iPxLrPos, FfxFloat32 fMotionDivergence)
     FfxFloat32 fReactiveSamples[9];
     FfxFloat32 fTransparencyAndCompositionSamples[9];
 
-    FFX_UNROLL
-    for (FfxInt32 y = -1; y < 2; y++) {
-        FFX_UNROLL
-        for (FfxInt32 x = -1; x < 2; x++) {
-
-            const FfxInt32x2 sampleCoord = ClampLoad(iPxLrPos, FfxInt32x2(x, y), FfxInt32x2(RenderSize()));
-
-            FfxInt32 sampleIdx = (y + 1) * 3 + x + 1;
-
-            FfxFloat32x3 fColorSample = LoadInputColor(sampleCoord).xyz;
-            FfxFloat32 fReactiveSample = LoadReactiveMask(sampleCoord);
-            FfxFloat32 fTransparencyAndCompositionSample = LoadTransparencyAndCompositionMask(sampleCoord);
-
-            fColorSamples[sampleIdx] = fColorSample;
-            fReactiveSamples[sampleIdx] = fReactiveSample;
-            fTransparencyAndCompositionSamples[sampleIdx] = fTransparencyAndCompositionSample;
-
-            fMasksSum += (fReactiveSample + fTransparencyAndCompositionSample);
-        }
+    // FFX_UNROLL is empty for GLSL, and dynamic private-array indexing spills on
+    // NVIDIA OpenGL. Explicit expansion lets glslang scalarize all three arrays.
+#define FFX_FSR2_LOAD_REACTIVE_SAMPLE(X, Y)                                                              \
+    {                                                                                                    \
+        const FfxInt32x2 sampleCoord =                                                                   \
+            ClampLoad(iPxLrPos, FfxInt32x2((X), (Y)), FfxInt32x2(RenderSize()));                         \
+        const FfxInt32 sampleIdx = ((Y) + 1) * 3 + (X) + 1;                                             \
+        const FfxFloat32x3 fColorSample = LoadInputColor(sampleCoord).xyz;                              \
+        const FfxFloat32 fReactiveSample = LoadReactiveMask(sampleCoord);                               \
+        const FfxFloat32 fTransparencyAndCompositionSample =                                            \
+            LoadTransparencyAndCompositionMask(sampleCoord);                                             \
+        fColorSamples[sampleIdx] = fColorSample;                                                         \
+        fReactiveSamples[sampleIdx] = fReactiveSample;                                                   \
+        fTransparencyAndCompositionSamples[sampleIdx] = fTransparencyAndCompositionSample;              \
+        fMasksSum += (fReactiveSample + fTransparencyAndCompositionSample);                              \
     }
+
+    FFX_FSR2_LOAD_REACTIVE_SAMPLE(-1, -1)
+    FFX_FSR2_LOAD_REACTIVE_SAMPLE( 0, -1)
+    FFX_FSR2_LOAD_REACTIVE_SAMPLE( 1, -1)
+    FFX_FSR2_LOAD_REACTIVE_SAMPLE(-1,  0)
+    FFX_FSR2_LOAD_REACTIVE_SAMPLE( 0,  0)
+    FFX_FSR2_LOAD_REACTIVE_SAMPLE( 1,  0)
+    FFX_FSR2_LOAD_REACTIVE_SAMPLE(-1,  1)
+    FFX_FSR2_LOAD_REACTIVE_SAMPLE( 0,  1)
+    FFX_FSR2_LOAD_REACTIVE_SAMPLE( 1,  1)
+
+#undef FFX_FSR2_LOAD_REACTIVE_SAMPLE
 
     if (fMasksSum > 0)
     {
-        for (FfxInt32 sampleIdx = 0; sampleIdx < 9; sampleIdx++)
-        {
-            FfxFloat32x3 fColorSample = fColorSamples[sampleIdx];
-            FfxFloat32 fReactiveSample = fReactiveSamples[sampleIdx];
-            FfxFloat32 fTransparencyAndCompositionSample = fTransparencyAndCompositionSamples[sampleIdx];
+#define FFX_FSR2_ACCUMULATE_REACTIVE_SAMPLE(SAMPLE_IDX)                                              \
+    {                                                                                                \
+        const FfxFloat32x3 fColorSample = fColorSamples[(SAMPLE_IDX)];                               \
+        const FfxFloat32 fReactiveSample = fReactiveSamples[(SAMPLE_IDX)];                           \
+        const FfxFloat32 fTransparencyAndCompositionSample =                                        \
+            fTransparencyAndCompositionSamples[(SAMPLE_IDX)];                                        \
+        const FfxFloat32 fMaxLenSq =                                                                 \
+            ffxMax(dot(fReferenceColor, fReferenceColor), dot(fColorSample, fColorSample));          \
+        const FfxFloat32 fSimilarity = dot(fReferenceColor, fColorSample) / fMaxLenSq;               \
+        const FfxFloat32 fPowerBiasMax = 6.0f;                                                       \
+        const FfxFloat32 fSimilarityPower =                                                         \
+            1.0f + (fPowerBiasMax - fSimilarity * fPowerBiasMax);                                    \
+        const FfxFloat32 fWeightedReactiveSample = ffxPow(fReactiveSample, fSimilarityPower);        \
+        const FfxFloat32 fWeightedTransparencyAndCompositionSample =                                \
+            ffxPow(fTransparencyAndCompositionSample, fSimilarityPower);                             \
+        fReactiveFactor = ffxMax(                                                                    \
+            fReactiveFactor,                                                                         \
+            FfxFloat32x2(fWeightedReactiveSample, fWeightedTransparencyAndCompositionSample));       \
+    }
 
-            const FfxFloat32 fMaxLenSq = ffxMax(dot(fReferenceColor, fReferenceColor), dot(fColorSample, fColorSample));
-            const FfxFloat32 fSimilarity = dot(fReferenceColor, fColorSample) / fMaxLenSq;
+        FFX_FSR2_ACCUMULATE_REACTIVE_SAMPLE(0)
+        FFX_FSR2_ACCUMULATE_REACTIVE_SAMPLE(1)
+        FFX_FSR2_ACCUMULATE_REACTIVE_SAMPLE(2)
+        FFX_FSR2_ACCUMULATE_REACTIVE_SAMPLE(3)
+        FFX_FSR2_ACCUMULATE_REACTIVE_SAMPLE(4)
+        FFX_FSR2_ACCUMULATE_REACTIVE_SAMPLE(5)
+        FFX_FSR2_ACCUMULATE_REACTIVE_SAMPLE(6)
+        FFX_FSR2_ACCUMULATE_REACTIVE_SAMPLE(7)
+        FFX_FSR2_ACCUMULATE_REACTIVE_SAMPLE(8)
 
-            // Increase power for non-similar samples
-            const FfxFloat32 fPowerBiasMax = 6.0f;
-            const FfxFloat32 fSimilarityPower = 1.0f + (fPowerBiasMax - fSimilarity * fPowerBiasMax);
-            const FfxFloat32 fWeightedReactiveSample = ffxPow(fReactiveSample, fSimilarityPower);
-            const FfxFloat32 fWeightedTransparencyAndCompositionSample = ffxPow(fTransparencyAndCompositionSample, fSimilarityPower);
-
-            fReactiveFactor = ffxMax(fReactiveFactor, FfxFloat32x2(fWeightedReactiveSample, fWeightedTransparencyAndCompositionSample));
-        }
+#undef FFX_FSR2_ACCUMULATE_REACTIVE_SAMPLE
     }
 
     StoreDilatedReactiveMasks(iPxLrPos, fReactiveFactor);

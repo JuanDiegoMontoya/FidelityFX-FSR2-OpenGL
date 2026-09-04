@@ -97,8 +97,6 @@ FfxFloat32x4 ComputeUpsampledColorAndWeight(const AccumulationPassCommonParams p
     #include "ffx_fsr2_force16_end.h"
     #endif
 
-    FfxFloat32x3 fSamples[iLanczos2SampleCount];
-
     FfxFloat32x2 fSrcUnjitteredPos = (FfxFloat32x2(iSrcInputPos) + FfxFloat32x2(0.5f, 0.5f)) - Jitter(); // This is the un-jittered position of the sample at offset 0,0
 
     FfxInt32x2 offsetTL;
@@ -114,21 +112,25 @@ FfxFloat32x4 ComputeUpsampledColorAndWeight(const AccumulationPassCommonParams p
 
     FfxFloat32x2 fOffsetTL = FfxFloat32x2(offsetTL);
 
-    FFX_UNROLL
-    for (FfxInt32 row = 0; row < 3; row++) {
+    // Keep the sample indices literal. NVIDIA's OpenGL compiler otherwise puts
+    // this private array in local memory despite the constant loop bounds.
+    #define FFX_FSR2_LOAD_UPSAMPLE_SAMPLE(row, col, sampleIndex)                                                   \
+        FfxInt32x2 sampleColRow##sampleIndex = FfxInt32x2(bFlipCol ? (3 - col) : col, bFlipRow ? (3 - row) : row); \
+        FfxInt32x2 iSrcSamplePos##sampleIndex = FfxInt32x2(iSrcInputPos) + offsetTL + sampleColRow##sampleIndex;    \
+        const FfxInt32x2 sampleCoord##sampleIndex = ClampLoad(iSrcSamplePos##sampleIndex, FfxInt32x2(0, 0), FfxInt32x2(RenderSize())); \
+        FfxFloat32x3 fSample##sampleIndex = LoadPreparedInputColor(FfxInt32x2(sampleCoord##sampleIndex));
 
-        FFX_UNROLL
-            for (FfxInt32 col = 0; col < 3; col++) {
-                FfxInt32 iSampleIndex = col + (row << 2);
+    FFX_FSR2_LOAD_UPSAMPLE_SAMPLE(0, 0, 0)
+    FFX_FSR2_LOAD_UPSAMPLE_SAMPLE(0, 1, 1)
+    FFX_FSR2_LOAD_UPSAMPLE_SAMPLE(0, 2, 2)
+    FFX_FSR2_LOAD_UPSAMPLE_SAMPLE(1, 0, 4)
+    FFX_FSR2_LOAD_UPSAMPLE_SAMPLE(1, 1, 5)
+    FFX_FSR2_LOAD_UPSAMPLE_SAMPLE(1, 2, 6)
+    FFX_FSR2_LOAD_UPSAMPLE_SAMPLE(2, 0, 8)
+    FFX_FSR2_LOAD_UPSAMPLE_SAMPLE(2, 1, 9)
+    FFX_FSR2_LOAD_UPSAMPLE_SAMPLE(2, 2, 10)
 
-                FfxInt32x2 sampleColRow = FfxInt32x2(bFlipCol ? (3 - col) : col, bFlipRow ? (3 - row) : row);
-                FfxInt32x2 iSrcSamplePos = FfxInt32x2(iSrcInputPos) + offsetTL + sampleColRow;
-
-                const FfxInt32x2 sampleCoord = ClampLoad(iSrcSamplePos, FfxInt32x2(0, 0), FfxInt32x2(RenderSize()));
-
-                fSamples[iSampleIndex] = LoadPreparedInputColor(FfxInt32x2(sampleCoord));
-            }
-    }
+    #undef FFX_FSR2_LOAD_UPSAMPLE_SAMPLE
 
     FfxFloat32x4 fColorAndWeight = FfxFloat32x4(0.0f, 0.0f, 0.0f, 0.0f);
 
@@ -144,33 +146,32 @@ FfxFloat32x4 ComputeUpsampledColorAndWeight(const AccumulationPassCommonParams p
 
     const FfxFloat32 fRectificationCurveBias = ffxLerp(-2.0f, -3.0f, ffxSaturate(params.fHrVelocity / 50.0f));
 
-    FFX_UNROLL
-    for (FfxInt32 row = 0; row < 3; row++) {
-        FFX_UNROLL
-        for (FfxInt32 col = 0; col < 3; col++) {
-            FfxInt32 iSampleIndex = col + (row << 2);
-
-            const FfxInt32x2 sampleColRow = FfxInt32x2(bFlipCol ? (3 - col) : col, bFlipRow ? (3 - row) : row);
-            const FfxFloat32x2 fOffset = fOffsetTL + FfxFloat32x2(sampleColRow);
-            FfxFloat32x2 fSrcSampleOffset = fBaseSampleOffset + fOffset;
-
-            FfxInt32x2 iSrcSamplePos = FfxInt32x2(iSrcInputPos) + FfxInt32x2(offsetTL) + sampleColRow;
-
-            const FfxFloat32 fOnScreenFactor = FfxFloat32(IsOnScreen(FfxInt32x2(iSrcSamplePos), FfxInt32x2(RenderSize())));
-            FfxFloat32 fSampleWeight = fOnScreenFactor * FfxFloat32(GetUpsampleLanczosWeight(fSrcSampleOffset, fKernelBias));
-
-            fColorAndWeight += FfxFloat32x4(fSamples[iSampleIndex] * fSampleWeight, fSampleWeight);
-
-            // Update rectification box
-            {
-                const FfxFloat32 fSrcSampleOffsetSq = dot(fSrcSampleOffset, fSrcSampleOffset);
-                const FfxFloat32 fBoxSampleWeight = exp(fRectificationCurveBias * fSrcSampleOffsetSq);
-
-                const FfxBoolean bInitialSample = (row == 0) && (col == 0);
-                RectificationBoxAddSample(bInitialSample, clippingBox, fSamples[iSampleIndex], fBoxSampleWeight);
-            }
+    #define FFX_FSR2_ACCUMULATE_UPSAMPLE_SAMPLE(row, col, sampleIndex)                                             \
+        {                                                                                                          \
+            const FfxInt32x2 sampleColRow = FfxInt32x2(bFlipCol ? (3 - col) : col, bFlipRow ? (3 - row) : row);    \
+            const FfxFloat32x2 fOffset = fOffsetTL + FfxFloat32x2(sampleColRow);                                    \
+            FfxFloat32x2 fSrcSampleOffset = fBaseSampleOffset + fOffset;                                            \
+            FfxInt32x2 iSrcSamplePos = FfxInt32x2(iSrcInputPos) + FfxInt32x2(offsetTL) + sampleColRow;              \
+            const FfxFloat32 fOnScreenFactor = FfxFloat32(IsOnScreen(FfxInt32x2(iSrcSamplePos), FfxInt32x2(RenderSize()))); \
+            FfxFloat32 fSampleWeight = fOnScreenFactor * FfxFloat32(GetUpsampleLanczosWeight(fSrcSampleOffset, fKernelBias)); \
+            fColorAndWeight += FfxFloat32x4(fSample##sampleIndex * fSampleWeight, fSampleWeight);                   \
+            const FfxFloat32 fSrcSampleOffsetSq = dot(fSrcSampleOffset, fSrcSampleOffset);                          \
+            const FfxFloat32 fBoxSampleWeight = exp(fRectificationCurveBias * fSrcSampleOffsetSq);                 \
+            const FfxBoolean bInitialSample = (row == 0) && (col == 0);                                             \
+            RectificationBoxAddSample(bInitialSample, clippingBox, fSample##sampleIndex, fBoxSampleWeight);        \
         }
-    }
+
+    FFX_FSR2_ACCUMULATE_UPSAMPLE_SAMPLE(0, 0, 0)
+    FFX_FSR2_ACCUMULATE_UPSAMPLE_SAMPLE(0, 1, 1)
+    FFX_FSR2_ACCUMULATE_UPSAMPLE_SAMPLE(0, 2, 2)
+    FFX_FSR2_ACCUMULATE_UPSAMPLE_SAMPLE(1, 0, 4)
+    FFX_FSR2_ACCUMULATE_UPSAMPLE_SAMPLE(1, 1, 5)
+    FFX_FSR2_ACCUMULATE_UPSAMPLE_SAMPLE(1, 2, 6)
+    FFX_FSR2_ACCUMULATE_UPSAMPLE_SAMPLE(2, 0, 8)
+    FFX_FSR2_ACCUMULATE_UPSAMPLE_SAMPLE(2, 1, 9)
+    FFX_FSR2_ACCUMULATE_UPSAMPLE_SAMPLE(2, 2, 10)
+
+    #undef FFX_FSR2_ACCUMULATE_UPSAMPLE_SAMPLE
 
     RectificationBoxComputeVarianceBoxData(clippingBox);
 
